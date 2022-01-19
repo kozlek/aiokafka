@@ -210,6 +210,7 @@ class GroupCoordinator(BaseCoordinator):
 
     def __init__(self, client, subscription, *,
                  group_id='aiokafka-default-group',
+                 group_instance_id=None,
                  session_timeout_ms=10000, heartbeat_interval_ms=3000,
                  retry_backoff_ms=100,
                  enable_auto_commit=True, auto_commit_interval_ms=5000,
@@ -241,6 +242,7 @@ class GroupCoordinator(BaseCoordinator):
         self.generation = OffsetCommitRequest.DEFAULT_GENERATION_ID
         self.member_id = JoinGroupRequest[0].UNKNOWN_MEMBER_ID
         self.group_id = group_id
+        self.group_instance_id = group_instance_id
         self.coordinator_id = None
 
         # Coordination flags and futures
@@ -346,9 +348,11 @@ class GroupCoordinator(BaseCoordinator):
         return task
 
     async def _maybe_leave_group(self):
-        if self.generation > 0:
+        if self.generation > 0 and self.group_instance_id is None:
             # this is a minimal effort attempt to leave the group. we do not
             # attempt any resending if the request fails or times out.
+            # Note: do not send this leave request if we are running in static
+            # partition assignment mode (when group_instance_id has been set).
             version = 0 if self._client.api_version < (0, 11, 0) else 1
             request = LeaveGroupRequest[version](self.group_id, self.member_id)
             try:
@@ -402,7 +406,11 @@ class GroupCoordinator(BaseCoordinator):
             'Invalid assignment protocol: %s' % assignment_strategy
         member_metadata = {}
         all_subscribed_topics = set()
-        for member_id, metadata_bytes in members:
+        for member in members:
+            if len(member) == 3:
+                member_id, group_instance_id, metadata_bytes = member
+            else:
+                member_id, metadata_bytes = member
             metadata = ConsumerProtocol.METADATA.decode(metadata_bytes)
             member_metadata[member_id] = metadata
             all_subscribed_topics.update(metadata.subscription)
@@ -421,6 +429,7 @@ class GroupCoordinator(BaseCoordinator):
                   " with subscriptions %s", self.group_id, assignor.name,
                   member_metadata)
 
+        # TODO: pass members group_instance_id to assignator
         assignments = assignor.assign(self._cluster, member_metadata)
         log.debug("Finished assignment for group %s: %s",
                   self.group_id, assignments)
@@ -1219,12 +1228,21 @@ class CoordinatorGroupRebalance:
                 self._coordinator.member_id,
                 ConsumerProtocol.PROTOCOL_TYPE,
                 metadata_list)
-        else:
+        elif self._api_version < (2, 3, 0):
             request = JoinGroupRequest[2](
                 self.group_id,
                 self._session_timeout_ms,
                 self._rebalance_timeout_ms,
                 self._coordinator.member_id,
+                ConsumerProtocol.PROTOCOL_TYPE,
+                metadata_list)
+        else:
+            request = JoinGroupRequest[3](
+                self.group_id,
+                self._session_timeout_ms,
+                self._rebalance_timeout_ms,
+                self._coordinator.member_id,
+                self._coordinator.group_instance_id,
                 ConsumerProtocol.PROTOCOL_TYPE,
                 metadata_list)
 
@@ -1261,6 +1279,9 @@ class CoordinatorGroupRebalance:
             if assignment_bytes is None:
                 return None
             return (protocol, assignment_bytes)
+        elif error_type is Errors.MemberIdRequired:
+            self._coordinator.member_id = response.member_id
+            return self.perform_group_join()
         elif error_type is Errors.GroupLoadInProgressError:
             # Backoff and retry
             log.debug("Attempt to join group %s rejected since coordinator %s"
@@ -1301,12 +1322,20 @@ class CoordinatorGroupRebalance:
 
     async def _on_join_follower(self):
         # send follower's sync group with an empty assignment
-        version = 0 if self._api_version < (0, 11, 0) else 1
-        request = SyncGroupRequest[version](
-            self.group_id,
-            self._coordinator.generation,
-            self._coordinator.member_id,
-            [])
+        if self._api_version < (2, 3, 0):
+            version = 0 if self._api_version < (0, 11, 0) else 1
+            request = SyncGroupRequest[version](
+                self.group_id,
+                self._coordinator.generation,
+                self._coordinator.member_id,
+                [])
+        else:
+            request = SyncGroupRequest[2](
+                self.group_id,
+                self._coordinator.generation,
+                self._coordinator.member_id,
+                self._coordinator.group_instance_id,
+                [])
         log.debug(
             "Sending follower SyncGroup for group %s to coordinator %s: %s",
             self.group_id, self.coordinator_id, request)
@@ -1338,12 +1367,20 @@ class CoordinatorGroupRebalance:
                 assignment = assignment.encode()
             assignment_req.append((member_id, assignment))
 
-        version = 0 if self._api_version < (0, 11, 0) else 1
-        request = SyncGroupRequest[version](
-            self.group_id,
-            self._coordinator.generation,
-            self._coordinator.member_id,
-            assignment_req)
+        if self._api_version < (2, 3, 0):
+            version = 0 if self._api_version < (0, 11, 0) else 1
+            request = SyncGroupRequest[version](
+                self.group_id,
+                self._coordinator.generation,
+                self._coordinator.member_id,
+                assignment_req)
+        else:
+            request = SyncGroupRequest[2](
+                self.group_id,
+                self._coordinator.generation,
+                self._coordinator.member_id,
+                self._coordinator.group_instance_id,
+                assignment_req)
 
         log.debug(
             "Sending leader SyncGroup for group %s to coordinator %s: %s",
